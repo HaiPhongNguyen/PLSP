@@ -118,7 +118,7 @@ const uint8_t SO_LAN_XAC_NHAN = 3;
 // Chênh lệch tối thiểu giữa tỷ lệ cao nhất và cao thứ hai.
 // Đơn vị: điểm phần trăm. Cần chỉnh theo vật màu thực tế.
 // Ví dụ: G=35%, R=33%, B=32% -> không xác định.
-const float CHENH_LECH_MAU_MIN = 10.0f;
+const float CHENH_LECH_MAU_MIN = 7.0f;
 // Ngưỡng thử ban đầu, cần chỉnh theo số đo thực tế.
 const uint16_t CLEAR_MIN = 20;
 // 50 ms: loại số đo gần bão hòa của TCS34725.
@@ -240,7 +240,7 @@ void gapVat() {
   diChuyenCham(1, 87);
 
   // Bước 2: SG2 và SG4 cùng tiếp cận vật.
-  diChuyenSG2SG4(102, 45);
+  diChuyenSG2SG4(110, 50);
 
   diChuyenCham(3, 15);
 
@@ -257,15 +257,15 @@ void gapVat() {
 void phanLoaiDo() {
   Serial.println("Dua vat vao hop DO...");
 
-  diChuyenCham(1, 25);
-  diChuyenSG2SG4(140, 90);
+  diChuyenCham(1, 28);
+  diChuyenSG2SG4(140, 95);
 
   // Mở ngón tay.
   diChuyenCham(3, 90);
 
   // Nâng tay.
   diChuyenSG2SG4(180, 120);
-
+  diChuyenCham(1, 87);
   Serial.println("Hoan tat thao tac hop DO.");
 }
 
@@ -274,11 +274,11 @@ void phanLoaiXanhLa() {
   Serial.println("Dua vat vao hop XANH LA...");
 
   diChuyenCham(1, 12);
-  diChuyenSG2SG4(150, 110);
+  diChuyenSG2SG4(160, 110);
 
   diChuyenCham(3, 90);
   diChuyenSG2SG4(180, 120);
-
+diChuyenCham(1, 87);
   Serial.println("Hoan tat thao tac hop XANH LA.");
 }
 
@@ -291,7 +291,7 @@ void phanLoaiXanhDuong() {
 
   diChuyenCham(3, 90);
   diChuyenSG2SG4(180, 120);
-
+diChuyenCham(1, 87);
   Serial.println("Hoan tat thao tac hop XANH DUONG.");
 }
 
