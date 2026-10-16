@@ -1,8 +1,31 @@
+/*
+  ESP32 + TCS34725 - NHAN DIEN TRUOC, VAN CHUYEN SAU
+  1. Motor OFF, dat tung vat truoc cam bien mau.
+  2. 3 lan doc lien tiep cung mau -> luu mau -> motor ON.
+  3. Cam bien vat can o vi tri gap bao vat -> motor OFF.
+  4. Cho 300 ms -> gap -> phan loai theo mau da luu -> ve home.
+  5. Cho cam bien gap het bao vat 300 ms -> lap lai tu buoc 1.
+
+  Vi tri doc mau phai nam TRUOC cam bien vat can theo chieu bang tai.
+  Chi dat 1 vat moi chu trinh; cho thong bao San sang roi dat vat tiep.
+  Nen khong vat can co ty le RGB gan can bang. Nguong mau can can chinh
+  theo Serial Monitor; phan mem khong the chac chan co vat chi tu RGB.
+  Giu chan, muc relay va cac goc servo cua code goc.
+  Cac thao tac servo van cho dong bo nhu ban goc: lenh Serial stop
+  chi duoc xu ly sau thao tac servo dang chay, khong phai dung khan cap.
+  Thu vien: ESP32Servo, Adafruit TCS34725 (kem Adafruit BusIO).
+  Serial Monitor: 115200 baud, Newline.
+*/
 #include <ESP32Servo.h>
-#include <GY33.h>
+#include <Wire.h>
+#include <Adafruit_TCS34725.h>
 #include <stdlib.h>
 
 // ================= CHÂN KẾT NỐI =================
+
+#define SDA_PIN         21
+#define SCL_PIN         22
+
 #define MOTOR_PIN       5
 #define OBSTACLE_PIN    32
 
@@ -11,33 +34,39 @@
 #define SG3_PIN         25
 #define SG4_PIN         26
 
-// Motor kích hoạt mức thấp
+// Motor kích hoạt mức thấp.
 #define MOTOR_ON        LOW
 #define MOTOR_OFF       HIGH
 
-// Đổi thành HIGH nếu cảm biến báo HIGH khi có vật
+// Đổi thành HIGH nếu cảm biến báo HIGH khi có vật.
 #define OBSTACLE_ACTIVE LOW
 
 // ================= THỜI GIAN =================
 
-// Mỗi bước servo di chuyển 1 độ.
-// Tăng giá trị này để chạy chậm hơn.
-const unsigned long THOI_GIAN_BUOC = 12;
+// Servo di chuyển mỗi bước 1 độ.
+// Tăng giá trị này để servo chạy chậm hơn.
+const unsigned long THOI_GIAN_BUOC = 10;
 
-// Chờ cơ cấu ổn định sau mỗi thao tác.
-const unsigned long THOI_GIAN_ON_DINH = 100;
+// Chờ cơ cấu ổn định sau thao tác.
+const unsigned long THOI_GIAN_ON_DINH = 200;
 
 // Chờ vật ổn định sau khi dừng băng tải.
 const unsigned long SETTLE_TIME = 300;
 
-// Thời gian tối đa chờ nhận diện màu.
-const unsigned long COLOR_TIMEOUT = 2000;
+// Quá thời gian này mà vật chưa đến vị trí gắp: dừng và báo lỗi.
+// Chỉnh theo chiều dài / tốc độ băng tải thực tế.
+const unsigned long TRANSPORT_TIMEOUT = 15000;
+const unsigned long CLEAR_STABLE_TIME = 300;
 
 // Khoảng cách giữa các lần đọc màu.
 const unsigned long READ_INTERVAL = 100;
 
 // ================= THIẾT BỊ =================
-GY33_I2C sensor;
+
+Adafruit_TCS34725 sensor(
+  TCS34725_INTEGRATIONTIME_50MS,
+  TCS34725_GAIN_4X
+);
 
 Servo sg1;
 Servo sg2;
@@ -50,12 +79,13 @@ Servo* danhSachServo[] = {
 
 // Thứ tự SG1, SG2, SG3, SG4.
 // Đây là góc điều khiển, không phải góc đo thực tế.
-int gocHienTai[] = {87, 180, 90, 120};
-int gocMucTieu[] = {87, 180, 90, 120};
+int gocHienTai[] = {87, 180, 110, 120};
+int gocMucTieu[] = {87, 180, 110, 120};
 
 unsigned long lanDiChuyenCuoi = 0;
 
 // ================= MÀU SẮC =================
+
 enum ObjectColor {
   COLOR_UNKNOWN,
   COLOR_RED,
@@ -64,25 +94,44 @@ enum ObjectColor {
 };
 
 // ================= TRẠNG THÁI =================
+
 enum SystemState {
-  RUNNING,
+  WAIT_COLOR,
+  TRANSPORT,
   WAIT_SETTLE,
-  READ_COLOR,
-  WAIT_OBJECT_CLEAR
+  WAIT_OBJECT_CLEAR,
+  FAULT
 };
 
-SystemState state = RUNNING;
+SystemState state = WAIT_OBJECT_CLEAR;
+ObjectColor mauDaChot = COLOR_UNKNOWN;
+unsigned long transportStartedAt = 0;
+unsigned long clearStartedAt = 0;
+bool dangDemHetVat = false;
+
+ObjectColor mauTruoc = COLOR_UNKNOWN;
+uint8_t soLanCungMau = 0;
+
+// Cần 3 lần liên tiếp nhận cùng màu.
+const uint8_t SO_LAN_XAC_NHAN = 3;
+
+// Chênh lệch tối thiểu giữa tỷ lệ cao nhất và cao thứ hai.
+// Đơn vị: điểm phần trăm. Cần chỉnh theo vật màu thực tế.
+// Ví dụ: G=35%, R=33%, B=32% -> không xác định.
+const float CHENH_LECH_MAU_MIN = 10.0f;
+// Ngưỡng thử ban đầu, cần chỉnh theo số đo thực tế.
+const uint16_t CLEAR_MIN = 20;
+// 50 ms: loại số đo gần bão hòa của TCS34725.
+const uint16_t RAW_MAX = 20000;
 
 bool cheDoTuDong = true;
 
 unsigned long stoppedAt = 0;
-unsigned long readStartedAt = 0;
 unsigned long lastReadAt = 0;
 
 String lenhSerial = "";
 
-// Khai báo trước các hàm dùng kiểu ObjectColor,
-// tránh lỗi tạo prototype tự động của Arduino.
+// Khai báo trước các hàm sử dụng kiểu ObjectColor.
 ObjectColor nhanDienMau(int r, int g, int b);
 void xuLyVat(ObjectColor color);
 
@@ -102,7 +151,6 @@ bool coVat() {
 
 // ================= CHUYỂN ĐỘNG SERVO =================
 
-// Cập nhật chuyển động từ từ cho cả 4 servo.
 void capNhatServo() {
   unsigned long bayGio = millis();
 
@@ -167,7 +215,6 @@ void diChuyenCham(int soServo, int goc) {
 }
 
 // SG2 và SG4 cùng bắt đầu di chuyển.
-// Servo có quãng đường ngắn hơn sẽ đến đích trước.
 void diChuyenSG2SG4(int gocSG2, int gocSG4) {
   if (gocSG2 < 0 || gocSG2 > 180 ||
       gocSG4 < 0 || gocSG4 > 180) {
@@ -189,18 +236,20 @@ void diChuyenSG2SG4(int gocSG2, int gocSG4) {
 void gapVat() {
   Serial.println("Bat dau gap vat...");
 
-  // SG1 đến vị trí gắp.
+  // Bước 1: SG1 đến vị trí gắp.
   diChuyenCham(1, 87);
 
-  // SG2 và SG4 cùng tiếp cận vật.
-  diChuyenSG2SG4(105, 45);
+  // Bước 2: SG2 và SG4 cùng tiếp cận vật.
+  diChuyenSG2SG4(102, 45);
 
-  // SG3 đóng ngón tay.
-  diChuyenCham(3, 30);
+  diChuyenCham(3, 15);
 
-  // SG2 và SG4 cùng nâng vật.
+  diChuyenSG2SG4(160, 75);
+  // Bước 3: SG3 co ngón tay gắp vật.
+  
+
+  // Bước 4: SG2 và SG4 cùng nâng vật.
   diChuyenSG2SG4(180, 120);
-
   Serial.println("Hoan tat gap va nang vat.");
 }
 
@@ -208,13 +257,13 @@ void gapVat() {
 void phanLoaiDo() {
   Serial.println("Dua vat vao hop DO...");
 
-  diChuyenCham(1, 27);
-  diChuyenSG2SG4(125, 75);
+  diChuyenCham(1, 25);
+  diChuyenSG2SG4(140, 90);
 
-  // Mở ngón tay để thả vật.
+  // Mở ngón tay.
   diChuyenCham(3, 90);
 
-  // Nâng tay lên.
+  // Nâng tay.
   diChuyenSG2SG4(180, 120);
 
   Serial.println("Hoan tat thao tac hop DO.");
@@ -225,10 +274,9 @@ void phanLoaiXanhLa() {
   Serial.println("Dua vat vao hop XANH LA...");
 
   diChuyenCham(1, 12);
-  diChuyenSG2SG4(145, 100);
+  diChuyenSG2SG4(150, 110);
 
   diChuyenCham(3, 90);
-
   diChuyenSG2SG4(180, 120);
 
   Serial.println("Hoan tat thao tac hop XANH LA.");
@@ -242,7 +290,6 @@ void phanLoaiXanhDuong() {
   diChuyenSG2SG4(155, 120);
 
   diChuyenCham(3, 90);
-
   diChuyenSG2SG4(180, 120);
 
   Serial.println("Hoan tat thao tac hop XANH DUONG.");
@@ -252,33 +299,88 @@ void phanLoaiXanhDuong() {
 void veViTriBanDau() {
   Serial.println("Quay ve vi tri ban dau...");
 
-  // Giữ nguyên thứ tự SG4 -> SG2 -> SG1 -> SG3.
+  // Giữ thứ tự chuyển động thực tế của code gốc.
+    diChuyenCham(1, 87);
   diChuyenCham(4, 120);
   diChuyenCham(2, 180);
-  diChuyenCham(1, 87);
-  diChuyenCham(3, 90);
+
+  diChuyenCham(3, 110);
 
   Serial.println("Da ve vi tri ban dau.");
 }
 
 // ================= NHẬN DIỆN MÀU =================
 
-// Nhận diện tạm thời bằng kênh RGB lớn nhất.
-// Cần hiệu chỉnh theo số đo thực tế của GY33.
+// Tỷ lệ màu = kênh / (R + G + B) * 100.
+// Chọn tỷ lệ cao nhất nếu hơn tỷ lệ thứ hai đủ rõ.
 ObjectColor nhanDienMau(int r, int g, int b) {
-  if (r > g && r > b) {
+  uint32_t tong = (uint32_t)r + g + b;
+
+  if (tong == 0) {
+    return COLOR_UNKNOWN;
+  }
+
+  float tyLe[3] = {
+    100.0f * r / tong,
+    100.0f * g / tong,
+    100.0f * b / tong
+  };
+
+  int lonNhat = 0;
+
+  for (int i = 1; i < 3; i++) {
+    if (tyLe[i] > tyLe[lonNhat]) {
+      lonNhat = i;
+    }
+  }
+
+  float thuHai = -1.0f;
+
+  for (int i = 0; i < 3; i++) {
+    if (i != lonNhat && tyLe[i] > thuHai) {
+      thuHai = tyLe[i];
+    }
+  }
+
+  // Loại trường hợp bằng nhau hoặc chênh lệch quá nhỏ.
+  if (tyLe[lonNhat] <= thuHai ||
+      tyLe[lonNhat] - thuHai < CHENH_LECH_MAU_MIN) {
+    return COLOR_UNKNOWN;
+  }
+
+  if (lonNhat == 0) {
     return COLOR_RED;
   }
 
-  if (g > r && g > b) {
+  if (lonNhat == 1) {
     return COLOR_GREEN;
   }
 
-  if (b > r && b > g) {
-    return COLOR_BLUE;
-  }
+  return COLOR_BLUE;
+}
 
-  return COLOR_UNKNOWN;
+// Chỉ reset dữ liệu màu, không làm servo di chuyển.
+void resetNhanDien() {
+  mauTruoc = COLOR_UNKNOWN;
+  soLanCungMau = 0;
+  mauDaChot = COLOR_UNKNOWN;
+}
+
+// Luôn dừng motor khi quay lại chờ. Cảm biến gắp phải hết báo vật
+// ổn định trước khi cho phép nhận diện vật tiếp theo.
+void batDauChoVat() {
+  dungBangTai();
+  resetNhanDien();
+  dangDemHetVat = false;
+  state = WAIT_OBJECT_CLEAR;
+}
+
+void baoLoiVanChuyen() {
+  dungBangTai();
+  resetNhanDien();
+  state = FAULT;
+  Serial.println("LOI: Vat khong toi cam bien trong 15 giay.");
+  Serial.println("Kiem tra / lay vat ra khoi bang tai, gui auto de thu lai.");
 }
 
 void xuLyVat(ObjectColor color) {
@@ -286,7 +388,7 @@ void xuLyVat(ObjectColor color) {
     return;
   }
 
-  // Băng tải dừng trong toàn bộ quá trình gắp.
+  // Băng tải dừng suốt quá trình gắp/thả.
   dungBangTai();
 
   gapVat();
@@ -317,10 +419,9 @@ void xuLyVat(ObjectColor color) {
 
 void vaoCheDoThuCong() {
   cheDoTuDong = false;
-  dungBangTai();
+  batDauChoVat();
 }
 
-// Xử lý lệnh Serial.
 void xuLyLenh(String lenh) {
   lenh.trim();
   lenh.toLowerCase();
@@ -337,24 +438,15 @@ void xuLyLenh(String lenh) {
   }
 
   if (lenh == "auto") {
-    // Chờ hoàn tất lệnh góc thủ công trước khi chạy.
+    // Chờ hoàn tất lệnh góc thủ công.
     choServoHoanTat();
 
     dungBangTai();
     veViTriBanDau();
 
     cheDoTuDong = true;
-    state = RUNNING;
-
-    // Nếu đang có vật, giữ băng tải dừng để đọc màu.
-    if (coVat()) {
-      stoppedAt = millis();
-      state = WAIT_SETTLE;
-    } else {
-      chayBangTai();
-    }
-
-    Serial.println("Da bat che do TU DONG.");
+    batDauChoVat();
+    Serial.println("TU DONG: motor dung, cho dat vat truoc cam bien mau.");
     return;
   }
 
@@ -388,7 +480,8 @@ void xuLyLenh(String lenh) {
     return;
   }
 
-  // Chu trình thủ công hoàn chỉnh theo từng màu.
+  // Chu trình thủ công theo màu.
+  // Các lệnh này chạy trực tiếp, không chờ cảm biến vật cản.
   if (lenh == "do") {
     vaoCheDoThuCong();
     xuLyVat(COLOR_RED);
@@ -407,7 +500,7 @@ void xuLyLenh(String lenh) {
     return;
   }
 
-  // Điều khiển từng servo: sg1-90, sg2-125...
+  // Điều khiển riêng: sg1-90, sg2-125...
   int viTriGach = lenh.indexOf('-');
 
   if (viTriGach < 0) {
@@ -493,74 +586,106 @@ void capNhatTuDong() {
   unsigned long now = millis();
 
   switch (state) {
-    case RUNNING:
+    case WAIT_OBJECT_CLEAR:
+      dungBangTai();
       if (coVat()) {
-        dungBangTai();
+        dangDemHetVat = false;
+      } else if (!dangDemHetVat) {
+        dangDemHetVat = true;
+        clearStartedAt = now;
+      } else if (now - clearStartedAt >= CLEAR_STABLE_TIME) {
+        resetNhanDien();
+        lastReadAt = now;
+        state = WAIT_COLOR;
+        Serial.println("San sang: dat 1 vat tai vi tri doc mau. Motor dang dung.");
+      }
+      break;
 
+    case WAIT_COLOR: {
+      // Vật ở vị trí gắp khi chưa chốt màu: không chạy và không gắp.
+      if (coVat()) {
+        batDauChoVat();
+        Serial.println("Vi tri gap dang co vat chua biet mau. Hay lay vat ra.");
+        break;
+      }
+      if (now - lastReadAt < READ_INTERVAL) break;
+      lastReadAt = now;
+
+      uint16_t r, g, b, c;
+      sensor.getRawData(&r, &g, &b, &c);
+      // Đọc màu có thể mất thời gian; kiểm tra lại cảm biến trước khi chạy.
+      if (coVat()) {
+        batDauChoVat();
+        break;
+      }
+      uint32_t tong = (uint32_t)r + g + b;
+      if (tong > 0) {
+        Serial.printf("R: %.1f%% | G: %.1f%% | B: %.1f%% | Clear: %u\n",
+          100.0f * r / tong, 100.0f * g / tong,
+          100.0f * b / tong, (unsigned)c);
+      }
+      ObjectColor color = (c < CLEAR_MIN || c >= RAW_MAX ||
+                              r >= RAW_MAX || g >= RAW_MAX || b >= RAW_MAX)
+        ? COLOR_UNKNOWN : nhanDienMau(r, g, b);
+      if (color == COLOR_UNKNOWN) {
+        mauTruoc = COLOR_UNKNOWN;
+        soLanCungMau = 0;
+      } else if (color == mauTruoc) {
+        if (soLanCungMau < SO_LAN_XAC_NHAN) soLanCungMau++;
+      } else {
+        mauTruoc = color;
+        soLanCungMau = 1;
+      }
+      if (soLanCungMau >= SO_LAN_XAC_NHAN) {
+        mauDaChot = color;
+        Serial.print("Da chot mau: ");
+        Serial.println(color == COLOR_RED ? "DO" :
+                       color == COLOR_GREEN ? "XANH LA" : "XANH DUONG");
+        transportStartedAt = millis();
+        state = TRANSPORT;
+        chayBangTai();
+        Serial.println("Chay bang tai, cho vat toi cam bien gap.");
+      }
+      break;
+    }
+
+    case TRANSPORT:
+      // Không đọc lại màu, không quay SG1 khi đang vận chuyển.
+      if (coVat()) {
+        dungBangTai();  // Dừng ngay khi phát hiện, bỏ delay(50) của bản cũ.
         stoppedAt = now;
         state = WAIT_SETTLE;
-
-        Serial.println("Phat hien vat. Dung bang tai.");
+        Serial.println("Vat toi vi tri gap. Dung bang tai, cho on dinh.");
+      } else if (now - transportStartedAt >= TRANSPORT_TIMEOUT) {
+        baoLoiVanChuyen();
       }
       break;
 
     case WAIT_SETTLE:
-      if (now - stoppedAt >= SETTLE_TIME) {
-        readStartedAt = now;
-        lastReadAt = now - READ_INTERVAL;
-        state = READ_COLOR;
-
-        Serial.println("Bat dau doc mau...");
-      }
-      break;
-
-    case READ_COLOR:
-      if (now - readStartedAt >= COLOR_TIMEOUT) {
-        Serial.println(
-          "Khong nhan dien duoc mau. Cho vat di qua."
-        );
-
-        chayBangTai();
-        state = WAIT_OBJECT_CLEAR;
-        break;
-      }
-
-      if (now - lastReadAt >= READ_INTERVAL) {
-        lastReadAt = now;
-
-        if (sensor.update()) {
-          GY33_Processed rgb = sensor.getProcessed();
-
-          Serial.print("R: ");
-          Serial.print(rgb.r);
-          Serial.print(" | G: ");
-          Serial.print(rgb.g);
-          Serial.print(" | B: ");
-          Serial.println(rgb.b);
-
-          ObjectColor color = nhanDienMau(
-            rgb.r, rgb.g, rgb.b
-          );
-
-          if (color != COLOR_UNKNOWN) {
-            xuLyVat(color);
-
-            chayBangTai();
-            state = WAIT_OBJECT_CLEAR;
-
-            Serial.println("Bang tai chay tiep.");
-          }
-        }
-      }
-      break;
-
-    case WAIT_OBJECT_CLEAR:
-      // Chờ cảm biến hết báo vật để tránh xử lý lặp.
+      dungBangTai();
       if (!coVat()) {
-        state = RUNNING;
-
-        Serial.println("San sang phat hien vat tiep theo.");
+        // Tín hiệu thoáng qua: chưa gắp, tiếp tục đưa vật tới cảm biến.
+        // Không reset thời gian vận chuyển để tránh chạy vô hạn.
+        if (now - transportStartedAt >= TRANSPORT_TIMEOUT) {
+          baoLoiVanChuyen();
+        } else {
+          state = TRANSPORT;
+          chayBangTai();
+        }
+      } else if (now - stoppedAt >= SETTLE_TIME) {
+        if (mauDaChot == COLOR_UNKNOWN) {
+          batDauChoVat();
+          break;
+        }
+        xuLyVat(mauDaChot);
+        // Hoàn thành: motor vẫn dừng. Không tự chạy như bản cũ.
+        batDauChoVat();
+        Serial.println("Xong chu trinh. Cho vat tiep theo tai cam bien mau.");
       }
+      break;
+
+    case FAULT:
+      dungBangTai();
       break;
   }
 }
@@ -591,13 +716,26 @@ void setup() {
   sg3.attach(SG3_PIN);
   sg4.attach(SG4_PIN);
 
-  // Gửi góc khởi tạo khi bật nguồn.
   for (int i = 0; i < 4; i++) {
     danhSachServo[i]->write(gocHienTai[i]);
   }
 
-  // Giữ API khởi tạo GY33 từ code bạn cung cấp.
-  sensor.begin();
+  // Cấu hình giống bản test TCS34725 đã chạy đúng.
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+
+  if (!sensor.begin(TCS34725_ADDRESS, &Wire)) {
+    dungBangTai();
+
+    Serial.println("KHONG TIM THAY TCS34725 tai 0x29!");
+    Serial.println("Kiem tra nguon, SDA 21, SCL 22 va reset ESP32.");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("TCS34725 ket noi thanh cong.");
 
   delay(500);
 
@@ -615,21 +753,14 @@ void setup() {
   Serial.println("Moi lenh mot dong, roi nhan Enter.");
   Serial.println("He thong khoi dong o che do TU DONG.");
 
-  if (coVat()) {
-    dungBangTai();
-    stoppedAt = millis();
-    state = WAIT_SETTLE;
-  } else {
-    state = RUNNING;
-    chayBangTai();
-  }
+  batDauChoVat();
+  Serial.println("Khoi dong: MOTOR DUNG. Dat tung vat tai cam bien mau.");
 }
 
 // ================= VÒNG LẶP =================
 
 void loop() {
   docLenhSerial();
-
   capNhatServo();
 
   if (cheDoTuDong) {
